@@ -33,6 +33,7 @@ pub const ErrorKind = enum {
     unterminated_quote,
     trailing_characters, // after the closing quote, or a trailing comment/whitespace
     duplicate_key,
+    carriage_return, // CRLF line endings are not supported
 };
 
 pub const Diagnostic = struct {
@@ -41,229 +42,115 @@ pub const Diagnostic = struct {
     kind: ErrorKind,
 };
 
-/// Entries are in file order. Caller frees the returned slice with `gpa.free`.
+/// Entries are in file order. Keys and values are slices into `source`, so
+/// `source` must outlive the returned entries. Caller frees the returned slice
+/// with `gpa.free`.
+///
+/// Blank lines (including whitespace-only lines) and comment lines (including
+/// indented ones) are ignored.
+///
 /// On error.Invalid, `diag` (if given) says where and why.
 pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: ?*Diagnostic) ![]Entry {
-    var entires: std.ArrayList(Entry) = .empty;
-    defer entires.deinit(gpa);
-    var seen_keys = std.StringHashMap(bool).init(gpa);
+    var entries: std.ArrayList(Entry) = .empty;
+    defer entries.deinit(gpa);
+    var seen_keys = std.StringHashMap(void).init(gpa);
     defer seen_keys.deinit();
-    var lines = std.mem.splitScalar(u8, source, '\n');
 
+    var lines = std.mem.splitScalar(u8, source, '\n');
     var line_number: usize = 1;
     while (lines.next()) |line| : (line_number += 1) {
-        const column: usize = 1;
-
-        if (std.mem.startsWith(u8, line, " ") or std.mem.startsWith(u8, line, "\t")) {
-            if (diag) |d| {
-                d.* = Diagnostic{
-                    .line = line_number,
-                    .column = column,
-                    .kind = ErrorKind.leading_whitespace,
-                };
-            }
-            return error.Invalid;
-        }
-        const trimmed = std.mem.trim(u8, line, " \t");
-        if (trimmed.len == 0) continue; // skip empty lines
-        if (std.mem.startsWith(u8, trimmed, "#")) continue; // skip comments
-
-        const eq_index = std.mem.indexOf(u8, trimmed, "=");
-        if (eq_index == null) {
-            if (diag) |d| {
-                d.* = Diagnostic{
-                    .line = line_number,
-                    .column = column,
-                    .kind = ErrorKind.missing_equals,
-                };
-            }
-            return error.Invalid;
+        if (std.mem.indexOfScalar(u8, line, '\r')) |i| {
+            return fail(diag, line_number, i + 1, .carriage_return);
         }
 
-        const key = trimmed[0..eq_index.?];
-        const value_start = eq_index.? + 1;
-        const value = trimmed[value_start..];
+        const content = std.mem.trimStart(u8, line, " \t");
+        if (content.len == 0 or content[0] == '#') continue;
+        if (content.len != line.len) return fail(diag, line_number, 1, .leading_whitespace);
 
-        if (std.mem.endsWith(u8, key, " ") or std.mem.endsWith(u8, key, "\t") or
-            std.mem.startsWith(u8, value, " ") or std.mem.startsWith(u8, value, "\t"))
-        {
-            if (diag) |d| {
-                d.* = Diagnostic{
-                    .line = line_number,
-                    .column = column,
-                    .kind = ErrorKind.whitespace_around_equals,
-                };
-            }
-            return error.Invalid;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse
+            return fail(diag, line_number, line.len + 1, .missing_equals);
+        const key = line[0..eq];
+        const value_start = eq + 1;
+        const value = line[value_start..];
+
+        if (key.len > 0 and isBlank(key[key.len - 1])) {
+            const ws_start = std.mem.trimEnd(u8, key, " \t").len;
+            return fail(diag, line_number, ws_start + 1, .whitespace_around_equals);
+        }
+        if (value.len > 0 and isBlank(value[0])) {
+            return fail(diag, line_number, value_start + 1, .whitespace_around_equals);
         }
 
-        // Validate key
-        if (!isValidKey(key)) {
-            if (diag) |d| {
-                d.* = Diagnostic{
-                    .line = line_number,
-                    .column = column,
-                    .kind = ErrorKind.invalid_key,
-                };
-            }
-            return error.Invalid;
-        }
+        if (invalidKeyIndex(key)) |i| return fail(diag, line_number, i + 1, .invalid_key);
 
-        // Validate value
-        const parsed_value = try parseValue(value, diag);
+        const parsed_value = try parseValue(value, line_number, value_start + 1, diag);
 
-        // Check for duplicate keys
-        if (seen_keys.get(key)) |exists| {
-            if (exists) {
-                if (diag) |d| {
-                    d.* = Diagnostic{
-                        .line = line_number,
-                        .column = column,
-                        .kind = ErrorKind.duplicate_key,
-                    };
-                }
-                return error.Invalid;
-            }
-        } else {
-            _ = try seen_keys.put(key, true);
-        }
+        const gop = try seen_keys.getOrPut(key);
+        if (gop.found_existing) return fail(diag, line_number, 1, .duplicate_key);
 
-        try entires.append(gpa, Entry{
+        try entries.append(gpa, .{
             .key = key,
             .value = parsed_value,
             .line = line_number,
         });
     }
 
-    return entires.toOwnedSlice(gpa);
+    return entries.toOwnedSlice(gpa);
 }
 
-fn isValidKey(key: []const u8) bool {
-    if (key.len == 0) return false;
+fn fail(diag: ?*Diagnostic, line: usize, column: usize, kind: ErrorKind) error{Invalid} {
+    if (diag) |d| d.* = .{ .line = line, .column = column, .kind = kind };
+    return error.Invalid;
+}
 
-    for (key, 0..) |char, i| {
-        if (i == 0) {
-            if (!std.ascii.isAlphabetic(char) and char != '_') return false;
-        } else {
-            if (!std.ascii.isAlphanumeric(char) and char != '_') return false;
-        }
+fn isBlank(c: u8) bool {
+    return c == ' ' or c == '\t';
+}
+
+/// Returns the index of the first invalid character in `key`, or null if the
+/// key is valid. An empty key is reported at index 0.
+fn invalidKeyIndex(key: []const u8) ?usize {
+    if (key.len == 0) return 0;
+    for (key, 0..) |c, i| {
+        const ok = c == '_' or (if (i == 0) std.ascii.isAlphabetic(c) else std.ascii.isAlphanumeric(c));
+        if (!ok) return i;
     }
-
-    return true;
+    return null;
 }
 
-fn isValidValue(value: []const u8) bool {
-    if (value.len == 0) return true; // empty value is valid
-
-    if (std.mem.startsWith(u8, value, "'")) {
-        // Quoted value
-        if (!std.mem.endsWith(u8, value, "'")) return false; // unterminated quote
-        // Check for trailing characters after the closing quote
-        const closing_quote_index = std.mem.indexOf(u8, value[1..], "'") orelse return false;
-        if (closing_quote_index + 2 < value.len) return false; // trailing characters after closing quote
-        return true;
-    } else {
-        // Unquoted value
-        // One or more characters from `A-Z a-z 0-9 _ - . / : @ % + , =`. Nothing else.
-        for (value) |char| {
-            if (!std.ascii.isAlphanumeric(char) and
-                char != '_' and
-                char != '-' and
-                char != '.' and
-                char != '/' and
-                char != ':' and
-                char != '@' and
-                char != '%' and
-                char != '+' and
-                char != ',' and
-                char != '=')
-            {
-                return false;
-            }
-        }
-        return true;
-    }
+/// Characters allowed in an unquoted value: `A-Z a-z 0-9 _ - . / : @ % + , =`.
+fn isUnquotedChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or switch (c) {
+        '_', '-', '.', '/', ':', '@', '%', '+', ',', '=' => true,
+        else => false,
+    };
 }
 
-fn parseValue(value: []const u8, diag: ?*Diagnostic) ![]const u8 {
-    if (value.len == 0) return value; // empty value is valid
+/// `value_col` is the 1-based column of `value[0]` within its line.
+fn parseValue(value: []const u8, line: usize, value_col: usize, diag: ?*Diagnostic) error{Invalid}![]const u8 {
+    if (value.len == 0) return value;
 
-    // Quoted value
-    if (std.mem.startsWith(u8, value, "'")) {
-        if (!std.mem.endsWith(u8, value, "'")) {
-            // unterminated quote
-            if (diag) |d| {
-                d.* = Diagnostic{
-                    .line = 0, // line number is not available here
-                    .column = 0, // column number is not available here
-                    .kind = ErrorKind.unterminated_quote,
-                };
+    switch (value[0]) {
+        '\'' => {
+            const close = std.mem.indexOfScalarPos(u8, value, 1, '\'') orelse
+                return fail(diag, line, value_col, .unterminated_quote);
+            if (close + 1 < value.len) {
+                return fail(diag, line, value_col + close + 1, .trailing_characters);
             }
-            return error.Invalid;
-        }
-
-        // Check for trailing characters after the closing quote
-        const closing_quote_index = std.mem.indexOf(u8, value[1..], "'") orelse {
-            if (diag) |d| {
-                d.* = Diagnostic{
-                    .line = 0, // line number is not available here
-                    .column = 0, // column number is not available here
-                    .kind = ErrorKind.unterminated_quote,
-                };
+            return value[1..close];
+        },
+        '"' => return fail(diag, line, value_col, .double_quotes),
+        else => {
+            for (value, 0..) |c, i| {
+                if (isUnquotedChar(c)) continue;
+                // Whitespace followed by nothing, or by a `#` comment, is trailing
+                // junk; anything else is a bad character that needs quoting.
+                const rest = std.mem.trimStart(u8, value[i..], " \t");
+                const trailing = isBlank(c) and (rest.len == 0 or rest[0] == '#');
+                return fail(diag, line, value_col + i, if (trailing) .trailing_characters else .invalid_unquoted_char);
             }
-            return error.Invalid;
-        };
-
-        // trailing characters after closing quote
-        if (closing_quote_index + 2 < value.len) {
-            if (diag) |d| {
-                d.* = Diagnostic{
-                    .line = 0, // line number is not available here
-                    .column = 0, // column number is not available here
-                    .kind = ErrorKind.trailing_characters,
-                };
-            }
-            return error.Invalid;
-        }
-
-        return value[1 .. closing_quote_index + 1]; // return the content inside the quotes
-    } else if (std.mem.startsWith(u8, value, "\"")) {
-        // Double quotes are not allowed
-        if (diag) |d| {
-            d.* = Diagnostic{
-                .line = 0, // line number is not available here
-                .column = 0, // column number is not available here
-                .kind = ErrorKind.double_quotes,
-            };
-        }
-        return error.Invalid;
-    } else {
-        // Unquoted value
-        // One or more characters from `A-Z a-z 0-9 _ - . / : @ % + , =`. Nothing else.
-        for (value) |char| {
-            if (!std.ascii.isAlphanumeric(char) and
-                char != '_' and
-                char != '-' and
-                char != '.' and
-                char != '/' and
-                char != ':' and
-                char != '@' and
-                char != '%' and
-                char != '+' and
-                char != ',' and
-                char != '=')
-            {
-                if (diag) |d| {
-                    d.* = Diagnostic{
-                        .line = 0, // line number is not available here
-                        .column = 0, // column number is not available here
-                        .kind = ErrorKind.invalid_unquoted_char,
-                    };
-                }
-                return error.Invalid;
-            }
-        }
-        return value;
+            return value;
+        },
     }
 }
 
@@ -277,64 +164,108 @@ const valid_example =
     \\ALSO_EMPTY=''
 ;
 
-const invalid_entries = std.EnumArray(ErrorKind, []const []const u8).init(.{
-    .leading_whitespace = &.{
-        "  KEY=value",
-    },
-    .missing_equals = &.{
-        "KEY",
-    },
-    .invalid_key = &.{
-        "export KEY=value",
-    },
-    .whitespace_around_equals = &.{
-        "KEY = value",
-    },
-    .invalid_unquoted_char = &.{
-        "KEY=hello world",
-    },
-    .double_quotes = &.{
-        "KEY=\"value\"",
-    },
-    .unterminated_quote = &.{
-        "KEY='unterminated",
-    },
-    .trailing_characters = &.{
-        "KEY='it''s'",
-    },
-    .duplicate_key = &.{
-        "KEY=value\nKEY=another",
-    },
-});
-
 test "parse valid example" {
     const allocator = std.testing.allocator;
     const entries = try parse(allocator, valid_example, null);
     defer allocator.free(entries);
 
-    try std.testing.expect(entries.len == 6);
-    try std.testing.expect(std.mem.eql(u8, entries[0].key, "DATABASE_URL"));
-    try std.testing.expect(std.mem.eql(u8, entries[0].value, "mysql://user:pa%40ss@db.example.com:3306/app"));
-    try std.testing.expect(std.mem.eql(u8, entries[1].key, "TOKEN"));
-    try std.testing.expect(std.mem.eql(u8, entries[1].value, "YWJjZA=="));
-    try std.testing.expect(std.mem.eql(u8, entries[2].key, "GREETING"));
-    try std.testing.expect(std.mem.eql(u8, entries[2].value, "hello world"));
-    try std.testing.expect(std.mem.eql(u8, entries[3].key, "PASSWORD"));
-    try std.testing.expect(std.mem.eql(u8, entries[3].value, "p$a#ss\"word"));
-    try std.testing.expect(std.mem.eql(u8, entries[4].key, "EMPTY"));
-    try std.testing.expect(std.mem.eql(u8, entries[4].value, ""));
-    try std.testing.expect(std.mem.eql(u8, entries[5].key, "ALSO_EMPTY"));
-    try std.testing.expect(std.mem.eql(u8, entries[5].value, ""));
+    const expected = [_]struct { []const u8, []const u8, usize }{
+        .{ "DATABASE_URL", "mysql://user:pa%40ss@db.example.com:3306/app", 2 },
+        .{ "TOKEN", "YWJjZA==", 3 },
+        .{ "GREETING", "hello world", 4 },
+        .{ "PASSWORD", "p$a#ss\"word", 5 },
+        .{ "EMPTY", "", 6 },
+        .{ "ALSO_EMPTY", "", 7 },
+    };
+    try std.testing.expectEqual(expected.len, entries.len);
+    for (expected, entries) |exp, entry| {
+        try std.testing.expectEqualStrings(exp[0], entry.key);
+        try std.testing.expectEqualStrings(exp[1], entry.value);
+        try std.testing.expectEqual(exp[2], entry.line);
+    }
 }
+
+test "parse skips blank, whitespace-only, and comment lines" {
+    const allocator = std.testing.allocator;
+    const source = "\n   \n\t\n# comment\n  # indented comment\nA=1\n";
+    const entries = try parse(allocator, source, null);
+    defer allocator.free(entries);
+
+    try std.testing.expectEqual(1, entries.len);
+    try std.testing.expectEqualStrings("A", entries[0].key);
+    try std.testing.expectEqualStrings("1", entries[0].value);
+    try std.testing.expectEqual(6, entries[0].line);
+}
+
+const InvalidCase = struct {
+    source: []const u8,
+    line: usize,
+    column: usize,
+};
+
+const invalid_entries = std.EnumArray(ErrorKind, []const InvalidCase).init(.{
+    .leading_whitespace = &.{
+        .{ .source = "  KEY=value", .line = 1, .column = 1 },
+        .{ .source = "\tKEY=value", .line = 1, .column = 1 },
+    },
+    .missing_equals = &.{
+        .{ .source = "KEY", .line = 1, .column = 4 },
+    },
+    .invalid_key = &.{
+        .{ .source = "export KEY=value", .line = 1, .column = 7 },
+        .{ .source = "=value", .line = 1, .column = 1 },
+        .{ .source = "1KEY=value", .line = 1, .column = 1 },
+    },
+    .whitespace_around_equals = &.{
+        .{ .source = "KEY = value", .line = 1, .column = 4 },
+        .{ .source = "KEY =value", .line = 1, .column = 4 },
+        .{ .source = "KEY= value", .line = 1, .column = 5 },
+    },
+    .invalid_unquoted_char = &.{
+        .{ .source = "KEY=hello world", .line = 1, .column = 10 },
+        .{ .source = "KEY=a$b", .line = 1, .column = 6 },
+    },
+    .double_quotes = &.{
+        .{ .source = "KEY=\"value\"", .line = 1, .column = 5 },
+    },
+    .unterminated_quote = &.{
+        .{ .source = "KEY='unterminated", .line = 1, .column = 5 },
+        .{ .source = "KEY='", .line = 1, .column = 5 },
+        .{ .source = "A=1\nB='x y\nC=3", .line = 2, .column = 3 },
+    },
+    .trailing_characters = &.{
+        .{ .source = "KEY='it''s'", .line = 1, .column = 9 },
+        .{ .source = "KEY='abc'def", .line = 1, .column = 10 },
+        .{ .source = "KEY='x'  ", .line = 1, .column = 8 },
+        .{ .source = "KEY=value  ", .line = 1, .column = 10 },
+        .{ .source = "KEY=value # comment", .line = 1, .column = 10 },
+    },
+    .duplicate_key = &.{
+        .{ .source = "KEY=value\nKEY=another", .line = 2, .column = 1 },
+        .{ .source = "A=1\nB=2\nA=3", .line = 3, .column = 1 },
+    },
+    .carriage_return = &.{
+        .{ .source = "KEY=value\r", .line = 1, .column = 10 },
+        .{ .source = "A=1\r\nB=2", .line = 1, .column = 4 },
+    },
+});
 
 test "parse invalid entries" {
     const allocator = std.testing.allocator;
 
     for (std.enums.values(ErrorKind)) |kind| {
-        for (invalid_entries.get(kind)) |source| {
+        for (invalid_entries.get(kind)) |case| {
+            errdefer std.debug.print("case ({t}): {f}\n", .{ kind, std.zig.fmtString(case.source) });
+
             var diag: Diagnostic = undefined;
-            try std.testing.expectError(error.Invalid, parse(allocator, source, &diag));
+            if (parse(allocator, case.source, &diag)) |entries| {
+                allocator.free(entries);
+                return error.TestExpectedError;
+            } else |err| try std.testing.expectEqual(error.Invalid, err);
+
             try std.testing.expectEqual(kind, diag.kind);
+            try std.testing.expectEqual(case.line, diag.line);
+            try std.testing.expectEqual(case.column, diag.column);
         }
     }
 }
