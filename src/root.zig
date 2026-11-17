@@ -44,10 +44,227 @@ pub const Diagnostic = struct {
 /// Entries are in file order. Caller frees the returned slice with `gpa.free`.
 /// On error.Invalid, `diag` (if given) says where and why.
 pub fn parse(gpa: std.mem.Allocator, source: []const u8, diag: ?*Diagnostic) ![]Entry {
-    _ = gpa; // TODO: use gpa
-    _ = source; // TODO: use source
-    _ = diag; // TODO: use diag
-    return error.Invalid;
+    var entires: std.ArrayList(Entry) = .empty;
+    defer entires.deinit(gpa);
+    var seen_keys = std.StringHashMap(bool).init(gpa);
+    defer seen_keys.deinit();
+    var lines = std.mem.splitScalar(u8, source, '\n');
+
+    var line_number: usize = 1;
+    while (lines.next()) |line| : (line_number += 1) {
+        const column: usize = 1;
+
+        if (std.mem.startsWith(u8, line, " ") or std.mem.startsWith(u8, line, "\t")) {
+            if (diag) |d| {
+                d.* = Diagnostic{
+                    .line = line_number,
+                    .column = column,
+                    .kind = ErrorKind.leading_whitespace,
+                };
+            }
+            return error.Invalid;
+        }
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (trimmed.len == 0) continue; // skip empty lines
+        if (std.mem.startsWith(u8, trimmed, "#")) continue; // skip comments
+
+        const eq_index = std.mem.indexOf(u8, trimmed, "=");
+        if (eq_index == null) {
+            if (diag) |d| {
+                d.* = Diagnostic{
+                    .line = line_number,
+                    .column = column,
+                    .kind = ErrorKind.missing_equals,
+                };
+            }
+            return error.Invalid;
+        }
+
+        const key = trimmed[0..eq_index.?];
+        const value_start = eq_index.? + 1;
+        const value = trimmed[value_start..];
+
+        if (std.mem.endsWith(u8, key, " ") or std.mem.endsWith(u8, key, "\t") or
+            std.mem.startsWith(u8, value, " ") or std.mem.startsWith(u8, value, "\t"))
+        {
+            if (diag) |d| {
+                d.* = Diagnostic{
+                    .line = line_number,
+                    .column = column,
+                    .kind = ErrorKind.whitespace_around_equals,
+                };
+            }
+            return error.Invalid;
+        }
+
+        // Validate key
+        if (!isValidKey(key)) {
+            if (diag) |d| {
+                d.* = Diagnostic{
+                    .line = line_number,
+                    .column = column,
+                    .kind = ErrorKind.invalid_key,
+                };
+            }
+            return error.Invalid;
+        }
+
+        // Validate value
+        const parsed_value = try parseValue(value, diag);
+
+        // Check for duplicate keys
+        if (seen_keys.get(key)) |exists| {
+            if (exists) {
+                if (diag) |d| {
+                    d.* = Diagnostic{
+                        .line = line_number,
+                        .column = column,
+                        .kind = ErrorKind.duplicate_key,
+                    };
+                }
+                return error.Invalid;
+            }
+        } else {
+            _ = try seen_keys.put(key, true);
+        }
+
+        try entires.append(gpa, Entry{
+            .key = key,
+            .value = parsed_value,
+            .line = line_number,
+        });
+    }
+
+    return entires.toOwnedSlice(gpa);
+}
+
+fn isValidKey(key: []const u8) bool {
+    if (key.len == 0) return false;
+
+    for (key, 0..) |char, i| {
+        if (i == 0) {
+            if (!std.ascii.isAlphabetic(char) and char != '_') return false;
+        } else {
+            if (!std.ascii.isAlphanumeric(char) and char != '_') return false;
+        }
+    }
+
+    return true;
+}
+
+fn isValidValue(value: []const u8) bool {
+    if (value.len == 0) return true; // empty value is valid
+
+    if (std.mem.startsWith(u8, value, "'")) {
+        // Quoted value
+        if (!std.mem.endsWith(u8, value, "'")) return false; // unterminated quote
+        // Check for trailing characters after the closing quote
+        const closing_quote_index = std.mem.indexOf(u8, value[1..], "'") orelse return false;
+        if (closing_quote_index + 2 < value.len) return false; // trailing characters after closing quote
+        return true;
+    } else {
+        // Unquoted value
+        // One or more characters from `A-Z a-z 0-9 _ - . / : @ % + , =`. Nothing else.
+        for (value) |char| {
+            if (!std.ascii.isAlphanumeric(char) and
+                char != '_' and
+                char != '-' and
+                char != '.' and
+                char != '/' and
+                char != ':' and
+                char != '@' and
+                char != '%' and
+                char != '+' and
+                char != ',' and
+                char != '=')
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+fn parseValue(value: []const u8, diag: ?*Diagnostic) ![]const u8 {
+    if (value.len == 0) return value; // empty value is valid
+
+    // Quoted value
+    if (std.mem.startsWith(u8, value, "'")) {
+        if (!std.mem.endsWith(u8, value, "'")) {
+            // unterminated quote
+            if (diag) |d| {
+                d.* = Diagnostic{
+                    .line = 0, // line number is not available here
+                    .column = 0, // column number is not available here
+                    .kind = ErrorKind.unterminated_quote,
+                };
+            }
+            return error.Invalid;
+        }
+
+        // Check for trailing characters after the closing quote
+        const closing_quote_index = std.mem.indexOf(u8, value[1..], "'") orelse {
+            if (diag) |d| {
+                d.* = Diagnostic{
+                    .line = 0, // line number is not available here
+                    .column = 0, // column number is not available here
+                    .kind = ErrorKind.unterminated_quote,
+                };
+            }
+            return error.Invalid;
+        };
+
+        // trailing characters after closing quote
+        if (closing_quote_index + 2 < value.len) {
+            if (diag) |d| {
+                d.* = Diagnostic{
+                    .line = 0, // line number is not available here
+                    .column = 0, // column number is not available here
+                    .kind = ErrorKind.trailing_characters,
+                };
+            }
+            return error.Invalid;
+        }
+
+        return value[1 .. closing_quote_index + 1]; // return the content inside the quotes
+    } else if (std.mem.startsWith(u8, value, "\"")) {
+        // Double quotes are not allowed
+        if (diag) |d| {
+            d.* = Diagnostic{
+                .line = 0, // line number is not available here
+                .column = 0, // column number is not available here
+                .kind = ErrorKind.double_quotes,
+            };
+        }
+        return error.Invalid;
+    } else {
+        // Unquoted value
+        // One or more characters from `A-Z a-z 0-9 _ - . / : @ % + , =`. Nothing else.
+        for (value) |char| {
+            if (!std.ascii.isAlphanumeric(char) and
+                char != '_' and
+                char != '-' and
+                char != '.' and
+                char != '/' and
+                char != ':' and
+                char != '@' and
+                char != '%' and
+                char != '+' and
+                char != ',' and
+                char != '=')
+            {
+                if (diag) |d| {
+                    d.* = Diagnostic{
+                        .line = 0, // line number is not available here
+                        .column = 0, // column number is not available here
+                        .kind = ErrorKind.invalid_unquoted_char,
+                    };
+                }
+                return error.Invalid;
+            }
+        }
+        return value;
+    }
 }
 
 const valid_example =
@@ -92,7 +309,6 @@ const invalid_entries = std.EnumArray(ErrorKind, []const []const u8).init(.{
 
 test "parse valid example" {
     const allocator = std.testing.allocator;
-
     const entries = try parse(allocator, valid_example, null);
     defer allocator.free(entries);
 
