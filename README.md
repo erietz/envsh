@@ -2,8 +2,10 @@
 
 Open a shell with a `.env` file loaded. Type `exit` when you're done.
 
+![demo](demo.gif)
+
 ```
-$ envsh test
+$ envsh .env.test
 envsh: loaded .env.test
 $ mysqlsh --uri "$DATABASE_URL"
 $ exit
@@ -12,14 +14,17 @@ $ exit
 ## Usage
 
 ```
-envsh NAME                  open $SHELL with ./.env.NAME loaded
-envsh NAME -- CMD [ARGS]    run CMD with ./.env.NAME loaded instead
-envsh -f PATH [-- CMD ...]  same, but with any file you like
+envsh [PATH]                 open $SHELL with PATH loaded
+envsh [PATH] -- CMD [ARGS]   run CMD with PATH loaded instead
 ```
 
+PATH defaults to `./.env`, so plain `envsh` loads the usual file. If a file name
+starts with `-`, write it as `./-name`.
+
 Variables from the file win over anything already in your environment. envsh also
-sets `ENVSH` to the name you passed, and it won't run if `ENVSH` is already set, so
-you can't accidentally end up with prod loaded on top of test.
+sets `ENVSH` to the file's name (`.env.test` for `config/.env.test`), and it won't
+run if `ENVSH` is already set, so you can't accidentally end up with prod loaded on
+top of test.
 
 To show it in your prompt, with bash:
 
