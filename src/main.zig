@@ -3,9 +3,8 @@ const std = @import("std");
 const dotenv = @import("dotenv");
 
 const usage =
-    \\usage: envsh NAME                  open $SHELL with ./.env.NAME loaded
-    \\       envsh NAME -- CMD [ARGS]    run CMD with ./.env.NAME loaded, instead of a shell
-    \\       envsh -f PATH [-- CMD ...]  same, with an explicit file; ENVSH is the file's basename
+    \\usage: envsh [PATH]                 open $SHELL with PATH loaded (default: ./.env)
+    \\       envsh [PATH] -- CMD [ARGS]   run CMD with PATH loaded, instead of a shell
     \\
 ;
 
@@ -28,52 +27,42 @@ const ParsedArgs = union(enum) {
     usage_error: []const u8,
 };
 
-/// `args` excludes argv[0]. Allocations go in `arena`.
-fn parseArgs(
-    arena: std.mem.Allocator,
-    args: []const []const u8,
-) std.mem.Allocator.Error!ParsedArgs {
-    if (args.len == 0) return .{ .usage_error = "missing NAME" };
+/// Loaded when no PATH is given.
+const default_path = ".env";
 
-    const first = args[0];
-    if (std.mem.eql(u8, first, "-h") or std.mem.eql(u8, first, "--help")) {
-        return .help;
+/// `args` excludes argv[0].
+fn parseArgs(args: []const []const u8) ParsedArgs {
+    var rest = args;
+    var path: []const u8 = default_path;
+    if (rest.len > 0) {
+        const first = rest[0];
+        if (std.mem.eql(u8, first, "-h") or std.mem.eql(u8, first, "--help")) {
+            return .help;
+        }
+        if (first.len == 0) return .{ .usage_error = "PATH must not be empty" };
+        if (!std.mem.eql(u8, first, "--")) {
+            if (first[0] == '-') {
+                return .{ .usage_error = "unknown option; use ./PATH for a file starting with '-'" };
+            }
+            path = first;
+            rest = rest[1..];
+        }
     }
 
-    var cmd: Command = undefined;
-    var rest: []const []const u8 = undefined;
-    if (std.mem.eql(u8, first, "-f")) {
-        if (args.len < 2) return .{ .usage_error = "-f needs a PATH" };
-        cmd.path = args[1];
-        cmd.name = std.fs.path.basename(cmd.path);
-        if (cmd.name.len == 0) {
-            return .{ .usage_error = "PATH has no file name" };
-        }
-        rest = args[2..];
-    } else if (first.len == 0) {
-        return .{ .usage_error = "NAME must not be empty" };
-    } else if (first[0] == '-') {
-        return .{ .usage_error = "unknown option" };
-    } else {
-        if (std.mem.indexOfScalar(u8, first, '/') != null) {
-            return .{ .usage_error = "NAME must not contain '/'; use -f PATH" };
-        }
-        cmd.name = first;
-        cmd.path = try std.fmt.allocPrint(arena, ".env.{s}", .{first});
-        rest = args[1..];
-    }
+    const name = std.fs.path.basename(path);
+    if (name.len == 0) return .{ .usage_error = "PATH has no file name" };
 
-    if (rest.len == 0) {
-        cmd.argv = null;
-    } else if (std.mem.eql(u8, rest[0], "--")) {
+    var argv: ?[]const []const u8 = null;
+    if (rest.len > 0) {
+        if (!std.mem.eql(u8, rest[0], "--")) {
+            return .{
+                .usage_error = "unexpected argument; put a command after '--'",
+            };
+        }
         if (rest.len == 1) return .{ .usage_error = "'--' needs a CMD" };
-        cmd.argv = rest[1..];
-    } else {
-        return .{
-            .usage_error = "unexpected argument; put a command after '--'",
-        };
+        argv = rest[1..];
     }
-    return .{ .run = cmd };
+    return .{ .run = .{ .path = path, .name = name, .argv = argv } };
 }
 
 /// Prints `envsh: <message>` to stderr and exits with `status`.
@@ -91,7 +80,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try arena.alloc([]const u8, raw_args.len -| 1);
     for (args, raw_args[1..]) |*dst, src| dst.* = src;
 
-    const cmd = switch (try parseArgs(arena, args)) {
+    const cmd = switch (parseArgs(args)) {
         .run => |c| c,
         .help => {
             var buf: [1024]u8 = undefined;
@@ -177,9 +166,7 @@ fn expectRun(
     name: []const u8,
     argv: ?[]const []const u8,
 ) !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const parsed = try parseArgs(arena_state.allocator(), args);
+    const parsed = parseArgs(args);
     try std.testing.expect(parsed == .run);
     const cmd = parsed.run;
     try std.testing.expectEqualStrings(path, cmd.path);
@@ -196,57 +183,54 @@ fn expectRun(
 }
 
 fn expectUsageError(args: []const []const u8) !void {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const parsed = try parseArgs(arena_state.allocator(), args);
-    try std.testing.expect(parsed == .usage_error);
+    try std.testing.expect(parseArgs(args) == .usage_error);
 }
 
-test "parseArgs: NAME" {
-    try expectRun(&.{"test"}, ".env.test", "test", null);
+test "parseArgs: no arguments loads .env" {
+    try expectRun(&.{}, ".env", ".env", null);
 }
 
-test "parseArgs: NAME -- CMD ARGS" {
+test "parseArgs: -- CMD loads .env" {
+    try expectRun(&.{ "--", "env" }, ".env", ".env", &.{"env"});
+}
+
+test "parseArgs: PATH" {
+    try expectRun(&.{".env.test"}, ".env.test", ".env.test", null);
+}
+
+test "parseArgs: PATH with directories" {
     try expectRun(
-        &.{ "test", "--", "mysqlsh", "--uri", "x" },
-        ".env.test",
-        "test",
-        &.{ "mysqlsh", "--uri", "x" },
-    );
-}
-
-test "parseArgs: -f PATH" {
-    try expectRun(
-        &.{ "-f", "config/prod.env" },
+        &.{"config/prod.env"},
         "config/prod.env",
         "prod.env",
         null,
     );
 }
 
-test "parseArgs: -f PATH -- CMD" {
+test "parseArgs: PATH -- CMD ARGS" {
     try expectRun(
-        &.{ "-f", "/tmp/x.env", "--", "env" },
-        "/tmp/x.env",
-        "x.env",
-        &.{"env"},
+        &.{ ".env.test", "--", "mysqlsh", "--uri", "x" },
+        ".env.test",
+        ".env.test",
+        &.{ "mysqlsh", "--uri", "x" },
     );
 }
 
+test "parseArgs: ./PATH starting with '-'" {
+    try expectRun(&.{"./-odd"}, "./-odd", "-odd", null);
+}
+
 test "parseArgs: help" {
-    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-    try std.testing.expect(try parseArgs(arena, &.{"--help"}) == .help);
-    try std.testing.expect(try parseArgs(arena, &.{"-h"}) == .help);
+    try std.testing.expect(parseArgs(&.{"--help"}) == .help);
+    try std.testing.expect(parseArgs(&.{"-h"}) == .help);
 }
 
 test "parseArgs: usage errors" {
-    try expectUsageError(&.{});
     try expectUsageError(&.{"-f"});
     try expectUsageError(&.{"-x"});
     try expectUsageError(&.{""});
-    try expectUsageError(&.{"../prod"});
-    try expectUsageError(&.{ "test", "--" });
-    try expectUsageError(&.{ "test", "extra" });
+    try expectUsageError(&.{"/"});
+    try expectUsageError(&.{"--"});
+    try expectUsageError(&.{ ".env.test", "--" });
+    try expectUsageError(&.{ ".env.test", "extra" });
 }
